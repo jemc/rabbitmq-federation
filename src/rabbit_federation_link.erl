@@ -168,12 +168,6 @@ handle_info({'EXIT', Ch, Reason},
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
 
-%% If we terminate due to a gen_server call exploding (almost
-%% certainly due to an amqp_channel:call() exploding) then we do not
-%% want to report the gen_server call in our status.
-terminate({E = {shutdown, _}, _}, State) ->
-    terminate(E, State);
-
 terminate(Reason, {not_started, {Upstream, XName}}) ->
     rabbit_federation_status:report(Upstream, XName, Reason),
     ok;
@@ -269,7 +263,7 @@ add_binding(B = #binding{key = Key, args = Args},
                            upstream = #upstream{exchange = XNameBin}}) ->
     case check_add_binding(B, State) of
         {true,  State1} -> State1;
-        {false, State1} -> amqp_channel:call(
+        {false, State1} -> amqp_channel_call(
                              Ch, #'exchange.bind'{
                                destination = IntXNameBin,
                                source      = XNameBin,
@@ -293,7 +287,7 @@ remove_binding(B = #binding{key = Key, args = Args},
                               upstream = #upstream{exchange = XNameBin}}) ->
     case check_remove_binding(B, State) of
         {true,  State1} -> State1;
-        {false, State1} -> amqp_channel:call(
+        {false, State1} -> amqp_channel_call(
                              Ch, #'exchange.unbind'{
                                destination = IntXNameBin,
                                source      = XNameBin,
@@ -325,7 +319,7 @@ go(S0 = {not_started, {Upstream, DownXName =
     case open_link(rabbit_federation_util:local_params(DownVHost)) of
         {ok, DConn, DCh} ->
             #'confirm.select_ok'{} =
-               amqp_channel:call(DCh, #'confirm.select'{}),
+               amqp_channel_call(DCh, #'confirm.select'{}),
             amqp_channel:register_confirm_handler(DCh, self()),
             case open_link(Upstream#upstream.params) of
                 {ok, Conn, Ch} ->
@@ -414,15 +408,15 @@ consume_from_upstream_queue(
                 _    -> [{<<"x-ha-policy">>, longstr, list_to_binary(HA)}]
             end,
     Args = ExpiryArg ++ TTLArg ++ HAArg,
-    amqp_channel:call(Ch, #'queue.declare'{queue     = Q,
+    amqp_channel_call(Ch, #'queue.declare'{queue     = Q,
                                            durable   = true,
                                            arguments = Args}),
     case Prefetch of
         none -> ok;
-        _    -> amqp_channel:call(Ch, #'basic.qos'{prefetch_count = Prefetch})
+        _    -> amqp_channel_call(Ch, #'basic.qos'{prefetch_count = Prefetch})
     end,
     #'basic.consume_ok'{} =
-        amqp_channel:subscribe(Ch, #'basic.consume'{queue  = Q,
+        amqp_channel_subscribe(Ch, #'basic.consume'{queue  = Q,
                                                     no_ack = false}, self()),
     State#state{queue = Q}.
 
@@ -441,7 +435,7 @@ ensure_upstream_bindings(State = #state{upstream            = Upstream,
              end,
     IntXNameBin = upstream_exchange_name(XNameBin, VHost, DownXName, Suffix),
     ensure_upstream_exchange(IntXNameBin, State),
-    amqp_channel:call(Ch, #'queue.bind'{exchange = IntXNameBin, queue = Q}),
+    amqp_channel_call(Ch, #'queue.bind'{exchange = IntXNameBin, queue = Q}),
     State1 = State#state{internal_exchange = IntXNameBin},
     State2 = lists:foldl(fun add_binding/2, State1, Bindings),
     rabbit_federation_db:set_active_suffix(DownXName, Upstream, Suffix),
@@ -464,7 +458,7 @@ ensure_upstream_exchange(IntXNameBin,
                                   arguments = [{?MAX_HOPS_ARG, long, MaxHops}]},
     Fan = Base#'exchange.declare'{type = <<"fanout">>},
     disposable_connection_call(Params, XFU, fun(?COMMAND_INVALID, _Text) ->
-                                                    amqp_channel:call(Ch, Fan)
+                                                    amqp_channel_call(Ch, Fan)
                                             end).
 
 upstream_queue_name(XNameBin, VHost, #resource{name         = DownXNameBin,
@@ -509,6 +503,22 @@ disposable_channel_call(Conn, Method, ErrFun) ->
             ErrFun(Code, Text)
     end,
     ensure_closed(Ch).
+
+%% If we terminate due to an amqp_channel:call() exploding then we do
+%% not want to report the gen_server call in our status.
+amqp_channel_call(Ch, Method) ->
+    try
+        amqp_channel:call(Ch, Method)
+    catch exit:{E = {shutdown, _}, _} ->
+            exit(E)
+    end.
+
+amqp_channel_subscribe(Ch, Method, Pid) ->
+    try
+        amqp_channel:subscribe(Ch, Method, Pid)
+    catch exit:{E = {shutdown, _}, _} ->
+            exit(E)
+    end.
 
 disposable_connection_call(Params, Method, ErrFun) ->
     case open(Params) of

@@ -147,21 +147,21 @@ handle_info({#'basic.deliver'{routing_key  = Key,
 
 %% If the downstream channel shuts down cleanly, we can just ignore it
 %% - we're the same node, we're presumably about to go down too.
-handle_info({'DOWN', _Ref, process, Ch, shutdown},
+handle_info({'EXIT', Ch, shutdown},
             State = #state{downstream_channel = Ch}) ->
     {noreply, State};
 
 %% If the upstream channel goes down for an intelligible reason, just
 %% log it and die quietly.
-handle_info({'DOWN', _Ref, process, Ch, {shutdown, Reason}},
+handle_info({'EXIT', Ch, {shutdown, Reason}},
             State = #state{channel = Ch}) ->
     connection_error(remote, {upstream_channel_down, Reason}, State);
 
-handle_info({'DOWN', _Ref, process, Ch, Reason},
+handle_info({'EXIT', Ch, Reason},
             State = #state{channel = Ch}) ->
     {stop, {upstream_channel_down, Reason}, State};
 
-handle_info({'DOWN', _Ref, process, Ch, Reason},
+handle_info({'EXIT', Ch, Reason},
             State = #state{downstream_channel = Ch}) ->
     {stop, {downstream_channel_down, Reason}, State};
 
@@ -185,6 +185,8 @@ terminate(Reason, #state{downstream_channel    = DCh,
                          connection            = Conn,
                          channel               = Ch}) ->
     rabbit_federation_status:report(Upstream, XName, Reason),
+    %% We are linked, but it would be nice to close-handshake if
+    %% possible.
     ensure_closed(DConn, DCh),
     ensure_closed(Conn, Ch),
     ok.
@@ -244,9 +246,10 @@ play_back_commands(State = #state{waiting_cmds = Waiting,
         true  -> State
     end.
 
-open_monitor(Params) ->
+open_link(Params) ->
     case open(Params) of
-        {ok, Conn, Ch} -> erlang:monitor(process, Ch),
+        {ok, Conn, Ch} -> link(Conn),
+                          link(Ch),
                           {ok, Conn, Ch};
         E              -> E
     end.
@@ -319,12 +322,12 @@ go(S0 = {not_started, {Upstream, DownXName =
     %% us to exit. We can therefore only trap exits when past that
     %% point. Bug 24372 may help us do something nicer.
     process_flag(trap_exit, true),
-    case open_monitor(rabbit_federation_util:local_params(DownVHost)) of
+    case open_link(rabbit_federation_util:local_params(DownVHost)) of
         {ok, DConn, DCh} ->
             #'confirm.select_ok'{} =
                amqp_channel:call(DCh, #'confirm.select'{}),
             amqp_channel:register_confirm_handler(DCh, self()),
-            case open_monitor(Upstream#upstream.params) of
+            case open_link(Upstream#upstream.params) of
                 {ok, Conn, Ch} ->
                     {Serial, Bindings} =
                         rabbit_misc:execute_mnesia_transaction(
@@ -339,34 +342,25 @@ go(S0 = {not_started, {Upstream, DownXName =
                     %% serial we will process. Since it compares larger than
                     %% any number we never process any commands. And we will
                     %% soon get told to stop anyway.
-                    try
-                        State = ensure_upstream_bindings(
-                                  consume_from_upstream_queue(
-                                    #state{upstream              = Upstream,
-                                           connection            = Conn,
-                                           channel               = Ch,
-                                           next_serial           = Serial,
-                                           downstream_connection = DConn,
-                                           downstream_channel    = DCh,
+                    State = ensure_upstream_bindings(
+                              consume_from_upstream_queue(
+                                #state{upstream              = Upstream,
+                                       connection            = Conn,
+                                       channel               = Ch,
+                                       next_serial           = Serial,
+                                       downstream_connection = DConn,
+                                       downstream_channel    = DCh,
                                        downstream_exchange   = DownXName}),
-                                  Bindings),
-                        rabbit_log:info("Federation ~s connected to ~s~n",
-                                        [rabbit_misc:rs(DownXName),
-                                         rabbit_federation_upstream:to_string(
-                                           Upstream)]),
-                        Name = pget(name, amqp_connection:info(DConn, [name])),
-                        rabbit_federation_status:report(
-                          Upstream, DownXName, {running, Name}),
-                        {noreply, State}
-                    catch exit:E ->
-                            %% terminate/2 will not get this, as we
-                            %% have not put them in our state yet
-                            ensure_closed(DConn, DCh),
-                            ensure_closed(Conn, Ch),
-                            exit(E)
-                    end;
+                              Bindings),
+                    rabbit_log:info("Federation ~s connected to ~s~n",
+                                    [rabbit_misc:rs(DownXName),
+                                     rabbit_federation_upstream:to_string(
+                                       Upstream)]),
+                    Name = pget(name, amqp_connection:info(DConn, [name])),
+                    rabbit_federation_status:report(
+                      Upstream, DownXName, {running, Name}),
+                    {noreply, State};
                 E ->
-                    ensure_closed(DConn, DCh),
                     connection_error(remote, E, S0)
             end;
         E ->

@@ -285,9 +285,9 @@ dynamic_reconfiguration_test() ->
                         [{<<"uri">>, <<"amqp://localhost">>}]),
               %% Do it twice so we at least hit the no-restart optimisation
               set_param("federation-upstream", "localhost",
-                        [{<<"uri">>, <<"amqp://">>}]),
+                        [{<<"uri">>, <<"rabbit-direct://">>}]),
               set_param("federation-upstream", "localhost",
-                        [{<<"uri">>, <<"amqp://">>}]),
+                        [{<<"uri">>, <<"rabbit-direct://">>}]),
               assert_connections(Xs, [<<"localhost">>]),
 
               %% And re-add the last - for next test

@@ -323,14 +323,14 @@ dynamic_reconfiguration_test() ->
               clear_param("federation-upstream", "local5673"),
               assert_connections(Xs, []),
 
-              %% Test that readding them and changing them works
+              %% Test that reading them and changing them works
               set_param("federation-upstream", "localhost",
                         "{\"uri\": \"amqp://localhost\"}"),
               %% Do it twice so we at least hit the no-restart optimisation
               set_param("federation-upstream", "localhost",
-                        "{\"uri\": \"amqp://\"}"),
+                        "{\"uri\": \"amqp://localhost\"}"),
               set_param("federation-upstream", "localhost",
-                        "{\"uri\": \"amqp://\"}"),
+                        "{\"uri\": \"amqp://localhost\"}"),
               assert_connections(Xs, [<<"localhost">>]),
 
               %% And re-add the last - for next test

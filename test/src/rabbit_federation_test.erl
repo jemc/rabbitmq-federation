@@ -103,6 +103,50 @@ unbind_on_unbind_test() ->
               delete_queue(Ch, Q2)
       end, ?UPSTREAM_DOWNSTREAM).
 
+user_id_test() ->
+    with_ch(
+      fun (Ch) ->
+              stop_other_node(?HARE),
+              start_other_node(?HARE),
+              {ok, Conn2} = amqp_connection:start(
+                              #amqp_params_network{username = <<"hare-user">>,
+                                                   password = <<"hare-user">>,
+                                                   port     = 5673}),
+              {ok, Ch2} = amqp_connection:open_channel(Conn2),
+              declare_exchange(Ch2, x(<<"upstream">>)),
+              declare_exchange(Ch, x(<<"hare.downstream">>)),
+              Q = bind_queue(Ch, <<"hare.downstream">>, <<"key">>),
+
+              Msg = #amqp_msg{props   = #'P_basic'{user_id = <<"hare-user">>},
+                              payload = <<"HELLO">>},
+              ExpectUser =
+                  fun (ExpUser) ->
+                          fun () ->
+                                  receive
+                                      {#'basic.deliver'{},
+                                       #amqp_msg{props   = Props,
+                                                 payload = Payload}} ->
+                                          #'P_basic'{user_id = ActUser} = Props,
+                                          ?assertEqual(<<"HELLO">>, Payload),
+                                          ?assertEqual(ExpUser, ActUser)
+                                  end
+                          end
+                  end,
+
+              publish(Ch2, <<"upstream">>, <<"key">>, Msg),
+              expect(Ch, Q, ExpectUser(undefined)),
+
+              set_param("federation-upstream", "local5673",
+                        "{\"uri\": \"amqp://localhost:5673\","
+                        " \"trust-user-id\": true}"),
+
+              publish(Ch2, <<"upstream">>, <<"key">>, Msg),
+              expect(Ch, Q, ExpectUser(<<"hare-user">>)),
+
+              delete_exchange(Ch, <<"hare.downstream">>),
+              delete_exchange(Ch2, <<"upstream">>)
+      end, []).
+
 %% In order to test that unbinds get sent we deliberately set up a
 %% broken config - with topic upstream and fanout downstream. You
 %% shouldn't really do this, but it lets us see "extra" messages that
@@ -139,6 +183,7 @@ no_loop_test() ->
 binding_recovery_test() ->
     Q = <<"durable-Q">>,
 
+    stop_other_node(?HARE),
     Ch = start_other_node(?HARE, "hare-two-upstreams"),
 
     declare_all(Ch, [x(<<"upstream2">>) | ?UPSTREAM_DOWNSTREAM]),
@@ -163,8 +208,6 @@ binding_recovery_test() ->
     ?assertEqual(none, suffix(?HARE, "upstream2")),
     delete_all(Ch2, [x(<<"upstream2">>) | ?UPSTREAM_DOWNSTREAM]),
     delete_queue(Ch2, Q),
-
-    stop_other_node(?HARE),
     ok.
 
 suffix({Nodename, _}, XName) ->
@@ -182,6 +225,7 @@ suffix({Nodename, _}, XName) ->
 restart_upstream_test() ->
     with_ch(
       fun (Downstream) ->
+              stop_other_node(?HARE),
               Upstream = start_other_node(?HARE),
 
               declare_exchange(Upstream, x(<<"upstream">>)),
@@ -208,9 +252,7 @@ restart_upstream_test() ->
               expect_empty(Downstream, Qgoes),
 
               delete_exchange(Downstream, <<"hare.downstream">>),
-              delete_exchange(Upstream1, <<"upstream">>),
-
-              stop_other_node(?HARE)
+              delete_exchange(Upstream1, <<"upstream">>)
       end, []).
 
 %% flopsy, mopsy and cottontail, connected in a ring with max_hops = 2
@@ -252,6 +294,7 @@ max_hops_test() ->
 upstream_has_no_federation_test() ->
     with_ch(
       fun (Downstream) ->
+              stop_other_node(?HARE),
               Upstream = start_other_node(
                            ?HARE, "hare-no-federation", "no_plugins"),
               declare_exchange(Upstream, x(<<"upstream">>)),
@@ -272,7 +315,7 @@ dynamic_reconfiguration_test() ->
               assert_connections(Xs, [<<"localhost">>, <<"local5673">>]),
 
               %% Test this at least does not blow up
-              set_param("federation", "local-nodename", <<"test">>),
+              set_param("federation", "local-nodename", "\"test\""),
               assert_connections(Xs, [<<"localhost">>, <<"local5673">>]),
 
               %% Test that clearing connections works
@@ -282,17 +325,17 @@ dynamic_reconfiguration_test() ->
 
               %% Test that readding them and changing them works
               set_param("federation-upstream", "localhost",
-                        [{<<"uri">>, <<"amqp://localhost">>}]),
+                        "{\"uri\": \"amqp://localhost\"}"),
               %% Do it twice so we at least hit the no-restart optimisation
               set_param("federation-upstream", "localhost",
-                        [{<<"uri">>, <<"rabbit-direct://">>}]),
+                        "{\"uri\": \"amqp://\"}"),
               set_param("federation-upstream", "localhost",
-                        [{<<"uri">>, <<"rabbit-direct://">>}]),
+                        "{\"uri\": \"amqp://\"}"),
               assert_connections(Xs, [<<"localhost">>]),
 
               %% And re-add the last - for next test
               set_param("federation-upstream", "local5673",
-                        [{<<"uri">>, <<"amqp://localhost:5673">>}])
+                        "{\"uri\": \"amqp://localhost:5673\"}")
       end, [x(<<"all.fed1">>), x(<<"all.fed2">>)]).
 
 dynamic_reconfiguration_integrity_test() ->
@@ -305,18 +348,18 @@ dynamic_reconfiguration_integrity_test() ->
 
               %% Create the set - links appear
               set_param("federation-upstream-set", "new-set",
-                        [[{<<"upstream">>, <<"localhost">>}]]),
+                        "[{\"upstream\": \"localhost\"}]"),
               assert_connections(Xs, [<<"localhost">>]),
 
               %% Add nonexistent connections to set - nothing breaks
               set_param("federation-upstream-set", "new-set",
-                        [[{<<"upstream">>, <<"localhost">>}],
-                         [{<<"upstream">>, <<"does-not-exist">>}]]),
+                        "[{\"upstream\": \"localhost\"},"
+                        " {\"upstream\": \"does-not-exist\"}]"),
               assert_connections(Xs, [<<"localhost">>]),
 
               %% Change connection in set - links change
               set_param("federation-upstream-set", "new-set",
-                        [[{<<"upstream">>, <<"local5673">>}]]),
+                        "[{\"upstream\": \"local5673\"}]"),
               assert_connections(Xs, [<<"local5673">>])
       end, [x(<<"new.fed1">>), x(<<"new.fed2">>)]).
 
@@ -329,11 +372,11 @@ federate_unfederate_test() ->
               assert_connections(Xs, []),
 
               %% Federate them - links appear
-              set_param("policy", "dyn", policy(<<"dyn.">>, <<"all">>)),
+              set_pol("dyn", "^dyn.", policy("all")),
               assert_connections(Xs, [<<"localhost">>, <<"local5673">>]),
 
               %% Unfederate them - links disappear
-              clear_param("policy", "dyn"),
+              clear_pol("dyn"),
               assert_connections(Xs, [])
       end, [x(<<"dyn.exch1">>), x(<<"dyn.exch2">>)]).
 
@@ -375,14 +418,20 @@ start_other_node({Name, Port}, Config, PluginsFile) ->
 
 stop_other_node({Name, _Port}) ->
     ?assertCmd("make -C " ++ plugin_dir() ++ " OTHER_NODE=" ++ Name ++
-                   " stop-other-node"),
+                      " stop-other-node"),
     timer:sleep(1000).
 
-set_param(Component, Key, Value) ->
-    rabbitmqctl(fmt("set_parameter ~s ~s '~p'", [Component, Key, Value])).
+set_param(Component, Name, Value) ->
+    rabbitmqctl(fmt("set_parameter ~s ~s '~s'", [Component, Name, Value])).
 
-clear_param(Component, Key) ->
-    rabbitmqctl(fmt("clear_parameter ~s ~s", [Component, Key])).
+clear_param(Component, Name) ->
+    rabbitmqctl(fmt("clear_parameter ~s ~s", [Component, Name])).
+
+set_pol(Name, Pattern, Defn) ->
+    rabbitmqctl(fmt("set_policy ~s \"~s\" '~s'", [Name, Pattern, Defn])).
+
+clear_pol(Name) ->
+    rabbitmqctl(fmt("clear_policy ~s ", [Name])).
 
 fmt(Fmt, Args) ->
     string:join(string:tokens(rabbit_misc:format(Fmt, Args), [$\n]), " ").
@@ -392,9 +441,8 @@ rabbitmqctl(Args) ->
        plugin_dir() ++ "/../rabbitmq-server/scripts/rabbitmqctl " ++ Args),
     timer:sleep(100).
 
-policy(Prefix, UpstreamSet) ->
-    [{<<"prefix">>, Prefix},
-     {<<"policy">>, [{<<"federation-upstream-set">>, UpstreamSet}]}].
+policy(UpstreamSet) ->
+    rabbit_misc:format("{\"federation-upstream-set\": \"~s\"}", [UpstreamSet]).
 
 plugin_dir() ->
     {ok, [[File]]} = init:get_argument(config),
@@ -443,21 +491,27 @@ delete_exchange(Ch, X) ->
 delete_queue(Ch, Q) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = Q}).
 
-publish(Ch, X, Key, Payload) ->
-    %% The trouble is that we transmit bindings upstream asynchronously...
-    timer:sleep(1000),
-    amqp_channel:call(Ch, #'basic.publish'{exchange    = X,
-                                           routing_key = Key},
-                      #amqp_msg{payload = Payload}).
+publish(Ch, X, Key, Payload) when is_binary(Payload) ->
+    publish(Ch, X, Key, #amqp_msg{payload = Payload});
 
-expect(Ch, Q, Payloads) ->
+publish(Ch, X, Key, Msg = #amqp_msg{}) ->
+    %% The trouble is that we transmit bindings upstream asynchronously...
+    timer:sleep(5000),
+    amqp_channel:call(Ch, #'basic.publish'{exchange    = X,
+                                           routing_key = Key}, Msg).
+
+
+expect(Ch, Q, Fun) when is_function(Fun) ->
     amqp_channel:subscribe(Ch, #'basic.consume'{queue  = Q,
                                                 no_ack = true}, self()),
     receive
         #'basic.consume_ok'{consumer_tag = CTag} -> ok
     end,
-    expect(Payloads),
-    amqp_channel:call(Ch, #'basic.cancel'{consumer_tag = CTag}).
+    Fun(),
+    amqp_channel:call(Ch, #'basic.cancel'{consumer_tag = CTag});
+
+expect(Ch, Q, Payloads) ->
+    expect(Ch, Q, fun() -> expect(Payloads) end).
 
 expect([]) ->
     ok;

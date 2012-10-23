@@ -59,13 +59,14 @@ from_set(SetName, X, UpstName) ->
     rabbit_federation_util:find_upstreams(UpstName, from_set(SetName, X)).
 
 from_set(<<"all">>, X) ->
-    Connections = rabbit_runtime_parameters:list(<<"federation-upstream">>),
-    Set = [[{<<"upstream">>, pget(key, C)}] || C <- Connections],
+    Connections = rabbit_runtime_parameters:list(
+                    vhost(X), <<"federation-upstream">>),
+    Set = [[{<<"upstream">>, pget(name, C)}] || C <- Connections],
     from_set_contents(Set, X);
 
 from_set(SetName, X) ->
     case rabbit_runtime_parameters:value(
-           <<"federation-upstream-set">>, SetName) of
+           vhost(X), <<"federation-upstream-set">>, SetName) of
         not_found -> [];
         Set       -> from_set_contents(Set, X)
     end.
@@ -76,7 +77,8 @@ from_set_contents(Set, X) ->
 
 from_set_element(UpstreamSetElem, X) ->
     Name = bget(upstream, UpstreamSetElem, []),
-    case rabbit_runtime_parameters:value(<<"federation-upstream">>, Name) of
+    case rabbit_runtime_parameters:value(
+           vhost(X), <<"federation-upstream">>, Name) of
         not_found  -> not_found;
         Upstream   -> from_props_connection(UpstreamSetElem, Name, Upstream, X)
     end.
@@ -93,6 +95,7 @@ from_props_connection(U, Name, C, X) ->
               max_hops        = bget('max-hops',        U, C, 1),
               expires         = bget(expires,           U, C, none),
               message_ttl     = bget('message-ttl',     U, C, none),
+              trust_user_id   = bget('trust-user-id',   U, C, false),
               ha_policy       = bget('ha-policy',       U, C, none),
               name            = Name}.
 

@@ -47,6 +47,8 @@
                 downstream_exchange,
                 unacked = gb_trees:empty()}).
 
+-define(MAX_CONNECTION_CLOSE_TIMEOUT, 10000).
+
 %%----------------------------------------------------------------------------
 
 %% We start off in a state where we do not connect, since we can first
@@ -124,7 +126,8 @@ handle_info({#'basic.deliver'{routing_key  = Key,
                               delivery_tag = DTag,
                               redelivered  = Redelivered}, Msg},
             State = #state{
-              upstream            = #upstream{max_hops = MaxHops} = Upstream,
+              upstream            = #upstream{max_hops      = MaxHops,
+                                              trust_user_id = Trust} = Upstream,
               downstream_exchange = #resource{name = XNameBin},
               downstream_channel  = DCh,
               unacked             = Unacked}) ->
@@ -140,12 +143,16 @@ handle_info({#'basic.deliver'{routing_key  = Key,
                  Seq = amqp_channel:next_publish_seqno(DCh),
                  amqp_channel:cast(DCh, #'basic.publish'{exchange    = XNameBin,
                                                          routing_key = Key},
-                                   update_headers(Headers, Msg)),
+                                   maybe_clear_user_id(
+                                     Trust, update_headers(Headers, Msg))),
                  {noreply, State#state{unacked = gb_trees:insert(Seq, DTag,
                                                                  Unacked)}};
         false -> ack(DTag, false, State), %% Drop it, but acknowledge it!
                  {noreply, State}
     end;
+
+handle_info(#'basic.cancel'{}, State) ->
+    connection_error(local, basic_cancel, State);
 
 %% If the downstream channel shuts down cleanly, we can just ignore it
 %% - we're the same node, we're presumably about to go down too.
@@ -173,13 +180,18 @@ handle_info(Msg, State) ->
 terminate(_Reason, {not_started, _}) ->
     ok;
 
-terminate(shutdown, #state{downstream_channel    = DCh,
+terminate(Reason, State = #state{downstream_connection = DConn,
+                                 connection            = Conn}) ->
+    ensure_connection_closed(DConn),
+    ensure_connection_closed(Conn),
+    log_terminate(Reason, State),
+    ok.
 
-                           downstream_connection = DConn,
-                           downstream_exchange   = XName,
-                           upstream              = Upstream,
-                           connection            = Conn,
-                           channel               = Ch}) ->
+log_terminate({shutdown, restart}, _State) ->
+    %% We've already logged this before munging the reason
+    ok;
+log_terminate(shutdown, #state{downstream_exchange = XName,
+                               upstream            = Upstream}) ->
     %% The supervisor is shutting us down; we are probably restarting
     %% the link because configuration has changed. So try to shut down
     %% nicely so that we do not cause unacked messages to be
@@ -187,18 +199,13 @@ terminate(shutdown, #state{downstream_channel    = DCh,
     rabbit_log:info("Federation ~s disconnecting from ~s~n",
                     [rabbit_misc:rs(XName),
                      rabbit_federation_upstream:to_string(Upstream)]),
-    ensure_closed(DConn, DCh),
-    ensure_closed(Conn, Ch),
-    rabbit_federation_status:remove(Upstream, XName),
-    ok;
+    rabbit_federation_status:remove(Upstream, XName);
 
-terminate(_Reason, #state{downstream_channel    = DCh,
-                          downstream_connection = DConn,
-                          connection            = Conn,
-                          channel               = Ch}) ->
-    ensure_closed(DConn, DCh),
-    ensure_closed(Conn, Ch),
-    ok.
+log_terminate(Reason, #state{downstream_exchange = XName,
+                             upstream            = Upstream}) ->
+    %% Unexpected death. sasl will log it, but we should update
+    %% rabbit_federation_status.
+    rabbit_federation_status:report(Upstream, XName, clean_reason(Reason)).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -330,7 +337,8 @@ go(S0 = {not_started, {Upstream, DownXName =
     %% us to exit. We can therefore only trap exits when past that
     %% point. Bug 24372 may help us do something nicer.
     process_flag(trap_exit, true),
-    case open_monitor(rabbit_federation_util:local_params(DownVHost)) of
+    case open_monitor(
+           rabbit_federation_util:local_params(Upstream, DownVHost)) of
         {ok, DConn, DCh} ->
             #'confirm.select_ok'{} =
                amqp_channel:call(DCh, #'confirm.select'{}),
@@ -373,12 +381,12 @@ go(S0 = {not_started, {Upstream, DownXName =
                     catch exit:E ->
                             %% terminate/2 will not get this, as we
                             %% have not put them in our state yet
-                            ensure_closed(DConn, DCh),
-                            ensure_closed(Conn, Ch),
+                            ensure_connection_closed(DConn),
+                            ensure_connection_closed(Conn),
                             connection_error(remote, E, S0)
                     end;
                 E ->
-                    ensure_closed(DConn, DCh),
+                    ensure_connection_closed(DConn),
                     connection_error(remote, E, S0)
             end;
         E ->
@@ -398,6 +406,14 @@ connection_error(remote, E, State = #state{upstream            = U,
     rabbit_log:info("Federation ~s disconnected from ~s~n~p~n",
                     [rabbit_misc:rs(XName),
                      rabbit_federation_upstream:to_string(U), E]),
+    {stop, {shutdown, restart}, State};
+
+connection_error(local, basic_cancel,
+                 State = #state{upstream            = U,
+                                downstream_exchange = XName}) ->
+    rabbit_federation_status:report(U, XName, {error, basic_cancel}),
+    rabbit_log:info("Federation ~s received 'basic.cancel'~n",
+                    [rabbit_misc:rs(XName)]),
     {stop, {shutdown, restart}, State};
 
 connection_error(local, E, State = {not_started, {U, XName}}) ->
@@ -426,19 +442,10 @@ consume_from_upstream_queue(
               params         = Params}
         = Upstream,
     Q = upstream_queue_name(name(X), vhost(Params), DownXName),
-    ExpiryArg = case Expiry of
-                    none -> [];
-                    _    -> [{<<"x-expires">>, long, Expiry}]
-                end,
-    TTLArg = case TTL of
-                 none -> [];
-                 _    -> [{<<"x-message-ttl">>, long, TTL}]
-             end,
-    HAArg = case HA of
-                none -> [];
-                _    -> [{<<"x-ha-policy">>, longstr, HA}]
-            end,
-    Args = ExpiryArg ++ TTLArg ++ HAArg,
+    Args = [Arg || {_K, _T, V} = Arg <- [{<<"x-expires">>,     long,    Expiry},
+                                         {<<"x-message-ttl">>, long,    TTL},
+                                         {<<"x-ha-policy">>,   longstr, HA}],
+                   V =/= none],
     amqp_channel:call(Ch, #'queue.declare'{queue     = Q,
                                            durable   = true,
                                            arguments = Args}),
@@ -454,8 +461,7 @@ ensure_upstream_bindings(State = #state{upstream            = Upstream,
                                         channel             = Ch,
                                         downstream_exchange = DownXName,
                                         queue               = Q}, Bindings) ->
-    #upstream{exchange = X,
-              params   = Params} = Upstream,
+    #upstream{exchange = X, params = Params} = Upstream,
     OldSuffix = rabbit_federation_db:get_active_suffix(
                   DownXName, Upstream, <<"A">>),
     Suffix = case OldSuffix of
@@ -513,7 +519,7 @@ ensure_internal_exchange(IntXNameBin,
 
 upstream_queue_name(XNameBin, VHost, #resource{name         = DownXNameBin,
                                                virtual_host = DownVHost}) ->
-    Node = rabbit_federation_util:local_nodename(),
+    Node = rabbit_federation_util:local_nodename(DownVHost),
     DownPart = case DownVHost of
                    VHost -> case DownXNameBin of
                                 XNameBin -> <<"">>;
@@ -540,8 +546,9 @@ disposable_channel_call(Conn, Method, ErrFun) ->
         amqp_channel:call(Ch, Method)
     catch exit:{{shutdown, {server_initiated_close, Code, Text}}, _} ->
             ErrFun(Code, Text)
-    end,
-    ensure_closed(Ch).
+    after
+        ensure_channel_closed(Ch)
+    end.
 
 disposable_connection_call(Params, Method, ErrFun) ->
     case open(Params) of
@@ -551,18 +558,17 @@ disposable_connection_call(Params, Method, ErrFun) ->
             catch exit:{{shutdown, {connection_closing,
                                     {server_initiated_close, Code, Txt}}}, _} ->
                     ErrFun(Code, Txt)
-            end,
-            ensure_closed(Conn, Ch);
+            after
+                ensure_connection_closed(Conn)
+            end;
         E ->
             E
     end.
 
-ensure_closed(Conn, Ch) ->
-    ensure_closed(Ch),
-    catch amqp_connection:close(Conn).
+ensure_channel_closed(Ch) -> catch amqp_channel:close(Ch).
 
-ensure_closed(Ch) ->
-    catch amqp_channel:close(Ch).
+ensure_connection_closed(Conn) ->
+    catch amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT).
 
 ack(Tag, Multiple, #state{channel = Ch}) ->
     amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = Tag,
@@ -582,6 +588,11 @@ remove_delivery_tags(Seq, true, Unacked) ->
 
 extract_headers(#amqp_msg{props = #'P_basic'{headers = Headers}}) ->
     Headers.
+
+maybe_clear_user_id(false, Msg = #amqp_msg{props = Props}) ->
+    Msg#amqp_msg{props = Props#'P_basic'{user_id = undefined}};
+maybe_clear_user_id(true, Msg) ->
+    Msg.
 
 update_headers(Headers, Msg = #amqp_msg{props = Props}) ->
     Msg#amqp_msg{props = Props#'P_basic'{headers = Headers}}.

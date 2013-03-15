@@ -69,8 +69,9 @@ find_upstreams(Name, Upstreams) ->
 validate_arg(Name, Type, Args) ->
     case rabbit_misc:table_lookup(Args, Name) of
         {Type, _} -> ok;
-        undefined -> fail("Argument ~s missing", [Name]);
-        _         -> fail("Argument ~s must be of type ~s", [Name, Type])
+        undefined -> {error, {exchange_invalid, "Argument ~s missing", [Name]}};
+        _         -> {error, {exchange_invalid,
+                              "Argument ~s must be of type ~s", [Name, Type]}}
     end.
 
 fail(Fmt, Args) -> rabbit_misc:protocol_error(precondition_failed, Fmt, Args).

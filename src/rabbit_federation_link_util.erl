@@ -147,34 +147,34 @@ clean_reason(E)                      -> E.
 
 %%----------------------------------------------------------------------------
 
-unacked_new() -> gb_trees:empty().
+unacked_new() -> {1, gb_trees:empty()}.
 
 ack(#'basic.ack'{delivery_tag = Seq,
-                 multiple     = Multiple}, Ch, Unack) ->
-    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = gb_trees:get(Seq, Unack),
+                 multiple     = Multiple}, Ch, {NextSeq, Tree}) ->
+    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = gb_trees:get(Seq, Tree),
                                        multiple     = Multiple}),
-    remove_delivery_tags(Seq, Multiple, Unack).
+    {NextSeq, remove_delivery_tags(Seq, Multiple, Tree)}.
 
 
 %% Note: at time of writing the broker will never send requeue=false. And it's
 %% hard to imagine why it would. But we may as well handle it.
 nack(#'basic.nack'{delivery_tag = Seq,
                    multiple     = Multiple,
-                   requeue      = Requeue}, Ch, Unack) ->
-    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = gb_trees:get(Seq, Unack),
+                   requeue      = Requeue}, Ch, {NextSeq, Tree}) ->
+    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = gb_trees:get(Seq, Tree),
                                         multiple     = Multiple,
                                         requeue      = Requeue}),
-    remove_delivery_tags(Seq, Multiple, Unack).
+    {NextSeq, remove_delivery_tags(Seq, Multiple, Tree)}.
 
-remove_delivery_tags(Seq, false, Unacked) ->
-    gb_trees:delete(Seq, Unacked);
-remove_delivery_tags(Seq, true, Unacked) ->
-    case gb_trees:is_empty(Unacked) of
-        true  -> Unacked;
-        false -> {Smallest, _Val, Unacked1} = gb_trees:take_smallest(Unacked),
+remove_delivery_tags(Seq, false, Tree) ->
+    gb_trees:delete(Seq, Tree);
+remove_delivery_tags(Seq, true, Tree) ->
+    case gb_trees:is_empty(Tree) of
+        true  -> Tree;
+        false -> {Smallest, _Val, Tree1} = gb_trees:take_smallest(Tree),
                  case Smallest > Seq of
-                     true  -> Unacked;
-                     false -> remove_delivery_tags(Seq, true, Unacked1)
+                     true  -> Tree;
+                     false -> remove_delivery_tags(Seq, true, Tree1)
                  end
     end.
 
@@ -186,14 +186,11 @@ forward(#upstream{ack_mode      = AckMode,
     case ForwardFun(Headers) of
         true  -> Msg1 = maybe_clear_user_id(
                           Trust, update_headers(HeadersFun(Headers), Msg)),
-                 Seq = case AckMode of
-                           'on-confirm' -> amqp_channel:next_publish_seqno(DCh);
-                           _            -> ignore
-                       end,
                  amqp_channel:cast(DCh, PublishMethod, Msg1),
                  case AckMode of
                      'on-confirm' ->
-                         gb_trees:insert(Seq, DT, Unacked);
+                         {Seq, Tree} = Unacked,
+                         {Seq + 1, gb_trees:insert(Seq, DT, Tree)};
                      'on-publish' ->
                          amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DT}),
                          Unacked;

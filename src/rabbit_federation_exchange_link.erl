@@ -418,13 +418,14 @@ consume_from_upstream_queue(
                                            durable   = true,
                                            arguments = Args}),
     NoAck = Upstream#upstream.ack_mode =:= 'no-ack',
-    case NoAck of
-        false -> amqp_channel:call(Ch, #'basic.qos'{prefetch_count = Prefetch});
-        true  -> ok
-    end,
+    CArgs = case NoAck of
+                true  -> [];
+                false -> [{<<"x-prefetch">>, long, Prefetch}]
+            end,
     #'basic.consume_ok'{consumer_tag = CTag} =
-        amqp_channel:subscribe(Ch, #'basic.consume'{queue  = Q,
-                                                    no_ack = NoAck}, self()),
+        amqp_channel:subscribe(Ch, #'basic.consume'{queue     = Q,
+                                                    no_ack    = NoAck,
+                                                    arguments = CArgs}, self()),
     State#state{consumer_tag = CTag,
                 queue        = Q}.
 

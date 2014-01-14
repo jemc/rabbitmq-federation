@@ -194,8 +194,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------------------------
 
 go(S0 = #not_started{run             = Run,
-                     upstream        = Upstream = #upstream{
-                                         prefetch_count = Prefetch},
+                     upstream        = Upstream,
                      upstream_params = UParams,
                      queue           = Queue = #amqqueue{name = QName}}) ->
     #upstream_params{x_or_q = UQueue = #amqqueue{
@@ -210,11 +209,6 @@ go(S0 = #not_started{run             = Run,
                                                      durable     = Durable,
                                                      auto_delete = AutoDelete,
                                                      arguments   = Args}),
-              case Upstream#upstream.ack_mode of
-                  'no-ack' -> ok;
-                  _        -> amqp_channel:call(
-                                Ch, #'basic.qos'{prefetch_count = Prefetch})
-              end,
               amqp_selective_consumer:register_default_consumer(Ch, self()),
               case Run of
                   true  -> consume(Ch, Upstream, UQueue);
@@ -276,14 +270,19 @@ visit_match({table, T}, Info) ->
 visit_match(_ ,_) ->
     false.
 
-consume(Ch, Upstream, UQueue) ->
-    NoAck = Upstream#upstream.ack_mode =:= 'no-ack',
+consume(Ch, #upstream{ack_mode       = AckMode,
+                      prefetch_count = Prefetch}, UQueue) ->
+    NoAck = AckMode =:= 'no-ack',
+    Args = case NoAck of
+               true  -> [];
+               false -> [{<<"x-prefetch">>, long, Prefetch}]
+           end ++ [{<<"x-priority">>, long, -1}],
     amqp_channel:cast(
       Ch, #'basic.consume'{queue        = name(UQueue),
                            no_ack       = NoAck,
                            nowait       = true,
                            consumer_tag = <<"consumer">>,
-                           arguments    = [{<<"x-priority">>, long, -1}]}).
+                           arguments    = Args}).
 
 cancel(Ch) ->
     amqp_channel:cast(Ch, #'basic.cancel'{nowait       = true,

@@ -399,6 +399,7 @@ go(S0 = {not_started, {Upstream, UParams, DownXName}}) ->
 consume_from_upstream_queue(
   State = #state{upstream            = Upstream,
                  upstream_params     = UParams,
+                 connection          = Conn,
                  channel             = Ch,
                  downstream_exchange = DownXName}) ->
     #upstream{prefetch_count = Prefetch,
@@ -418,6 +419,18 @@ consume_from_upstream_queue(
                                            durable   = true,
                                            arguments = Args}),
     NoAck = Upstream#upstream.ack_mode =:= 'no-ack',
+
+    CArgs = case NoAck of
+                true  -> [];
+                false -> case rabbit_federation_link_util:conn_feature(
+                                consumer_prefetch, Conn) of
+                             true  -> [{<<"x-prefetch">>, long, Prefetch}];
+                             false -> amqp_channel:call(
+                                        Ch, #'basic.qos'{
+                                          prefetch_count = Prefetch}),
+                                      []
+                         end
+            end,
     CArgs = case NoAck of
                 true  -> [];
                 false -> [{<<"x-prefetch">>, long, Prefetch}]

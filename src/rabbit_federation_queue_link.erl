@@ -31,7 +31,7 @@
 
 -record(not_started, {queue, run, upstream, upstream_params}).
 -record(state, {queue, run, conn, ch, dconn, dch, upstream, upstream_params,
-                unacked}).
+                unacked, consumer_prefetch}).
 
 start_link(Args) ->
     gen_server2:start_link(?MODULE, Args, [{timeout, infinity}]).
@@ -95,11 +95,12 @@ handle_cast(go, State = #not_started{}) ->
 handle_cast(go, State) ->
     {noreply, State};
 
-handle_cast(run, State = #state{upstream        = Upstream,
-                                upstream_params = UParams,
-                                ch              = Ch,
-                                run             = false}) ->
-    consume(Ch, Upstream, UParams#upstream_params.x_or_q),
+handle_cast(run, State = #state{upstream          = Upstream,
+                                upstream_params   = UParams,
+                                ch                = Ch,
+                                consumer_prefetch = ConsumerPrefetch,
+                                run               = false}) ->
+    consume(Ch, Upstream, UParams#upstream_params.x_or_q, ConsumerPrefetch),
     {noreply, State#state{run = true}};
 
 handle_cast(run, State = #not_started{}) ->
@@ -194,7 +195,8 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------------------------
 
 go(S0 = #not_started{run             = Run,
-                     upstream        = Upstream,
+                     upstream        = Upstream = #upstream{
+                                         prefetch_count = Prefetch},
                      upstream_params = UParams,
                      queue           = Queue = #amqqueue{name = QName}}) ->
     #upstream_params{x_or_q = UQueue = #amqqueue{
@@ -209,29 +211,35 @@ go(S0 = #not_started{run             = Run,
                                                      durable     = Durable,
                                                      auto_delete = AutoDelete,
                                                      arguments   = Args}),
+              ConsumerPrefetch = rabbit_federation_link_util:conn_feature(
+                                   consumer_prefetch, Conn),
+              case Upstream#upstream.ack_mode =:= 'no-ack'
+                  orelse ConsumerPrefetch of
+                  true  -> ok;
+                  false -> amqp_channel:call(
+                             Ch, #'basic.qos'{prefetch_count = Prefetch})
+              end,
               amqp_selective_consumer:register_default_consumer(Ch, self()),
               case Run of
-                  true  -> consume(Ch, Upstream, UQueue);
+                  true  -> consume(Ch, Upstream, UQueue, ConsumerPrefetch);
                   false -> ok
               end,
-              {noreply, #state{queue           = Queue,
-                               run             = Run,
-                               conn            = Conn,
-                               ch              = Ch,
-                               dconn           = DConn,
-                               dch             = DCh,
-                               upstream        = Upstream,
-                               upstream_params = UParams,
-                               unacked         = Unacked}}
+              {noreply, #state{queue             = Queue,
+                               run               = Run,
+                               conn              = Conn,
+                               ch                = Ch,
+                               dconn             = DConn,
+                               dch               = DCh,
+                               upstream          = Upstream,
+                               upstream_params   = UParams,
+                               unacked           = Unacked,
+                               consumer_prefetch = ConsumerPrefetch}}
       end, Upstream, UParams, QName, S0).
 
 check_upstream_suitable(Conn) ->
-    Props = pget(server_properties,
-                 amqp_connection:info(Conn, [server_properties])),
-    {table, Caps} = rabbit_misc:table_lookup(Props, <<"capabilities">>),
-    case rabbit_misc:table_lookup(Caps, <<"consumer_priorities">>) of
-        {bool, true} -> ok;
-        _            -> exit({error, upstream_lacks_consumer_priorities})
+    case rabbit_federation_link_util:conn_feature(consumer_priorities, Conn) of
+        true  -> ok;
+        false -> exit({error, upstream_lacks_consumer_priorities})
     end.
 
 update_headers(UParams, Redelivered, undefined) ->
@@ -271,15 +279,15 @@ visit_match(_ ,_) ->
     false.
 
 consume(Ch, #upstream{ack_mode       = AckMode,
-                      prefetch_count = Prefetch}, UQueue) ->
-    NoAck = AckMode =:= 'no-ack',
-    Args = case NoAck of
-               true  -> [];
-               false -> [{<<"x-prefetch">>, long, Prefetch}]
+                      prefetch_count = Prefetch}, UQueue, ConsumerPrefetch) ->
+    Ack = AckMode =/= 'no-ack',
+    Args = case Ack andalso ConsumerPrefetch of
+               true  -> [{<<"x-prefetch">>, long, Prefetch}];
+               false -> []
            end ++ [{<<"x-priority">>, long, -1}],
     amqp_channel:cast(
       Ch, #'basic.consume'{queue        = name(UQueue),
-                           no_ack       = NoAck,
+                           no_ack       = not Ack,
                            nowait       = true,
                            consumer_tag = <<"consumer">>,
                            arguments    = Args}).

@@ -23,7 +23,7 @@
 -export([start_conn_ch/5, disposable_channel_call/2, disposable_channel_call/3,
          disposable_connection_call/3, ensure_connection_closed/1,
          log_terminate/4, unacked_new/0, ack/3, nack/3, forward/9,
-         handle_down/6]).
+         handle_down/6, conn_feature/2]).
 
 %% temp
 -export([connection_error/6]).
@@ -303,3 +303,10 @@ maybe_impersonator(Trust, User = #user{tags = Tags}) ->
         true  -> User#user{tags = [impersonator | Tags]};
         false -> User
     end.
+
+conn_feature(Feature, Conn) ->
+    FeatureBin = list_to_binary(atom_to_list(Feature)),
+    Props = pget(server_properties,
+                 amqp_connection:info(Conn, [server_properties])),
+    {table, Caps} = rabbit_misc:table_lookup(Props, <<"capabilities">>),
+    {bool, true} =:= rabbit_misc:table_lookup(Caps, FeatureBin).

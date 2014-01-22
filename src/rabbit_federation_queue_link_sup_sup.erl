@@ -59,4 +59,4 @@ stop_child(Q) ->
 init([]) ->
     {ok, {{one_for_one, 3, 10}, []}}.
 
-id(Q = #amqqueue{}) -> Q.
+id(#amqqueue{name = QName}) -> QName.

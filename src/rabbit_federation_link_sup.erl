@@ -91,9 +91,9 @@ children(Sup, UpstreamName) ->
 %%----------------------------------------------------------------------------
 
 init(XorQ) ->
-    %% 1, ?MAX_WAIT so that we always give up straight away and get
+    %% 0, 1 so that we always give up straight away and get
     %% into the reconnect delay
-    {ok, {{one_for_one, 1, ?MAX_WAIT}, specs(XorQ)}}.
+    {ok, {{one_for_one, 0, 1}, specs(XorQ)}}.
 
 specs(XorQ) ->
     [spec(Upstream, XorQ) || Upstream <- rabbit_federation_upstream:for(XorQ)].

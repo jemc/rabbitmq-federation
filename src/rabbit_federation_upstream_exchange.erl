@@ -30,7 +30,7 @@
 
 -behaviour(rabbit_exchange_type).
 
--export([description/0, serialise_events/0, route/2]).
+-export([description/0, serialise_events/0, route/2, accept/2]).
 -export([validate/1, validate_binding/2,
          create/2, delete/3, policy_changed/2,
          add_binding/3, remove_bindings/3, assert_args_equivalence/2]).
@@ -42,6 +42,8 @@ description() ->
      {internal_purpose, federation}].
 
 serialise_events() -> false.
+
+accept(_X, D) -> D.
 
 route(X = #exchange{arguments = Args},
       D = #delivery{message = #basic_message{content = Content}}) ->

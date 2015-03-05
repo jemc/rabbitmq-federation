@@ -32,7 +32,7 @@
 
 -export([description/0, serialise_events/1]).
 -export([create/2, delete/3, policy_changed/2,
-         add_binding/3, remove_bindings/3, route/2, active_for/1]).
+         add_binding/3, remove_bindings/3, route/2, accept/2, active_for/1]).
 
 %%----------------------------------------------------------------------------
 
@@ -74,6 +74,7 @@ remove_bindings(Serial, X = #exchange{name = XName}, Bs) ->
     end.
 
 route(_, _) -> [].
+accept(_, D) -> D.
 
 active_for(X) ->
     case federate(X) of

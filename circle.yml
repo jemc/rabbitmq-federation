@@ -1,0 +1,15 @@
+
+dependencies:
+  cache_directories:
+    # Cache the library so we don't wait for them to build and clone each time
+    - /tmp/rabbitmq-public-umbrella
+  pre:
+    - 'cd /tmp && git clone https://github.com/rabbitmq/rabbitmq-public-umbrella.git || echo okay'
+    - 'cd /tmp/rabbitmq-public-umbrella && make co'
+    - 'cd /tmp/rabbitmq-public-umbrella/rabbitmq-federation && git pull'
+    - 'cd /tmp/rabbitmq-public-umbrella/rabbitmq-federation && make'
+
+test:
+  override:
+  # We must first kill the rabbitmq server that CircleCI runs by default, then run the tests.
+  - 'sudo killall beam.smp && cd /tmp/rabbitmq-public-umbrella/rabbitmq-federation && make test'
